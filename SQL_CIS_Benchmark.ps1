@@ -7,6 +7,7 @@
 ######################################################
 
 $Fix_Allowed = 0
+
  
 # 2.01 - 2.08 & 5.2
 function S-Name_Conf_InUse.F-SysConf ($name, $fix = $name, $PreQ = "", $Value = 0) {
@@ -74,7 +75,7 @@ function RemoteAdminConnection () {
     }
 }
 
-# 2.12 - Doesn't work well when 
+# 2.12
 function HideInstance {
     $QueryResults = @(Invoke-Sqlcmd -Query "DECLARE @getValue INT;
         EXEC master..xp_instance_regread
@@ -316,25 +317,40 @@ function GuestConnect {
 }
 
 # 3.3
- # TODO finish "fix"
 function OrphanedUsers {
-    $QueryResults = @(Invoke-Sqlcmd -Query "EXEC sp_change_users_login 'Report';")
+    $Q0 = "EXEC sp_change_users_login 'Report';"
+    $QueryResults = @(Invoke-Sqlcmd -Query $Q0)
+    $R1 = "No orphaned users +1"
     if ($QueryResults) {
         Write-Output("The following orphaned users found: +0`n$QueryResults")
         if ($Fix_Allowed -eq 1) {
             $Q1 = "DROP USER <login>" #removing user
-            $Q2 = "EXEC sp_change_users_login 'Update_One', <existing_user>, <login>" #re-mapping user
+            $Q2 = "EXEC sp_change_users_login 'Update_One', <database_user>, <login>" #re-mapping user
             $UserInput = Read-Host("Remove or Map orphaned users by running one of the following? [Y/n]`n$Q1`n$Q2`n")
             if ($UserInput -Notmatch "n") {
-                Invoke-Sqlcmd -Query $Query
-                Write-Output("xp_cmdshell disabled +1")
-                return 1
+                $db_principals = @(Invoke-Sqlcmd -Query "SELECT name FROM sys.database_principals")
+                foreach ($usr in $QueryResults) {
+                    if ($db_principals.IndexOf($usr) -ne -1) {
+                        $UserInput = @(Read-Host("Link orphaned user to the database user sharing the name $($usr)?"), 0)
+                    }
+                    else {
+                        $UserInput = @(Read-Host("Remove orphaned user with name $($usr)?"), 1)
+                    }
+                    if ($UserInput -Notmatch "n") {
+                        Invoke-Sqlcmd -Query $($(if ($UserInput[1]){$Q2} else{$Q1}) -Replace "(<database_user>)|(<login>)", $usr)
+                    }
+                }
+                $QueryResults = Invoke-Sqlcmd -Query $Q0
+                if (-not $QueryResults) {
+                    Write-Output($R1)
+                    return 1
+                }
             }
         }
         return 0
     }
     else {
-        Write-Output("xp_cmdshell disabled +1")
+        Write-Output($R1)
         return 1
     }
 }
@@ -368,40 +384,145 @@ function Contained_Authentication {
 
 # 4.2
 function CheckExpiration {
-
+    $Q1 = "SELECT l.[name], 'sysadmin membership' AS 'Access_Method'
+        FROM sys.sql_logins AS l
+        WHERE IS_SRVROLEMEMBER('sysadmin',name) = 1
+        AND l.is_expiration_checked <> 1
+        UNION ALL
+        SELECT l.[name], 'CONTROL SERVER' AS 'Access Method'
+        FROM sys.sql_logins AS l
+        JOIN sys.server_permissions AS p
+        ON l.principal_id = p.grantee_principal_id
+        WHERE p.type = 'CL' AND p.state IN ('G', 'W')
+        AND l.is_expiration_checked <> 1;"
+    $R1 = "All users with Sysadmin role have CHECK_EXPIRATION +1"
+    $QueryResults = @(Invoke-Sqlcmd -Query $Q1).name
+    if ($QueryResults) {
+        Write-Output(($R1.Replace("All", "Not all")).Replace("1", "0"))
+        if ($Fix_Allowed -eq 1) {
+            $Query = "ALTER LOGIN <login_name> WITH CHECK_EXPIRATION = ON;"
+            $UserInput = Read-Host("set 'CHECK_EXPIRATION' for all sysadmin users by running the following? [Y/n]`n$($Query)`n")
+            if ($UserInput -Notmatch "n") {
+                foreach ($usr in $QueryResults) {
+                    Invoke-Sqlcmd -Query $Query.Replace("<login_name>", $usr)
+                }
+                Write-Output($R1)
+                return 1
+            }
+            else {
+                $UserInput = Read-Host("Set 'CHECK_EXPIRATION' for some sysadmin users? [Y/n]")
+                if ($UserInput -Notmatch "n") {
+                    foreach ($usr in $QueryResults) {
+                        $UserInput = Read-Host("Set 'CHECK_EXPIRATION' for $usr? [Y/n]")
+                        if ($UserInput -Notmatch "n") {
+                            Invoke-Sqlcmd -Query $Query.Replace("<login_name>", $usr)
+                        }
+                    }
+                    if (-Not (Invoke-Sqlcmd -Query $Q1)) {
+                        Write-Output($R1)
+                        return 1
+                    }
+                }
+            }
+        }
+        return 0
+    }
+    else {
+        Write-Output($R1)
+        return 1
+    }
 }
 
 # 4.3
 function CheckPolicy {
-
+    $Q0 = "SELECT name, CAST(is_disabled as int) as is_disabled
+        FROM sys.sql_logins
+        WHERE is_policy_checked = 0;"
+    $Q1 = "ALTER LOGIN <login> WITH CHECK_POLICY = ON"
+    $R0 = "'CHECK_POLICY' enabled on all SQL authenticated logins +1"
+    $R1 = "Enable 'CHECK_POLICY' on all SQL authenticated logins? [Y/n]"
+    $QueryResults = @(Invoke-Sqlcmd -Query $Q0)
+    if ($QueryResults) {
+        if ($QueryResults.is_disabled.Contains(0)) {
+            Write-Output("'CHECK_POLICY' not enabled on the following SQL authenticated logins +0")
+            Write-Output($QueryResults)
+            if ($Fix_Allowed -eq 1) {
+                $UserInput = Read-Host("by running the following? [Y/n]`n$($Query)`n")
+                if ($Fix_Allowed) { $fix = 0
+                $UserInput = Read-Host($R1)
+                if ($UserInput -notmatch "n") { $fix = 1 }
+                else { $UserInput = Read-Host($R1.Replace("all", "some"))
+                    if ($UserInput -notmatch "n") { $fix = 2 }
+                }
+                if ($fix) {
+                    foreach ($usr in $QueryResults) {
+                        $UserInput = if($fix -eq 2) {Read-Host "Enable 'CHECK_POLICY' on $($usr)? [Y/n]"} else {"Y"}
+                        if ($UserInput -notmatch "n") {
+                            Invoke-Sqlcmd -Query $Q1.Replace("<login>", $usr)
+                        }
+                    }
+                }
+            }
+            }
+            return 0
+        }
+        $QueryResults = @(Invoke-Sqlcmd -Query $Q0.Replace("0", "0 AND is_disabled =1"))
+        if ($QueryResults.is_disabled.Contains(1)) {
+            Write-Output("CHECK_POLICY not enabled on the following disabled SQL authenticated login(s)")
+            if ($Fix_Allowed) { $fix = 0
+                $UserInput = Read-Host($R1.Replace("all", "all disabled"))
+                if ($UserInput -notmatch "n") { $fix = 1 }
+                else { $UserInput = Read-Host("Enable 'CHECK_POLICY' on some disabled SQL authenticated logins? [Y/n]")
+                    if ($UserInput -notmatch "n") { $fix = 2 }
+                }
+                if ($fix) {
+                    foreach ($usr in $QueryResults) {
+                        $UserInput = if($fix -eq 2) {Read-Host "Enable 'CHECK_POLICY' on $($usr)? [Y/n]"} else {"Y"}
+                        if ($UserInput -notmatch "n") {
+                            Invoke-Sqlcmd -Query $Q1.Replace("<login>", $usr)
+                        }
+                    }
+                }
+            }
+        }
+        $QueryResults = @(Invoke-Sqlcmd -Query $Q0)
+        if ($QueryResults.is_disabled.Contains(0)) {
+            Write-Output($R0)
+            return 1
+        }
+    }
+    else {
+        Write-Output($R0)
+        return 1
+    }
 }
 
-# 5.1 - doesn't work well when the reg key doesn't exist.
+# 5.1
 function MaxLogFiles {
-#   $QueryResults = @(Invoke-Sqlcmd -Query "DECLARE @NumErrorLogs int;
-#        EXECUTE master.sys.xp_instance
-#        N'HKEY LOCAL MACHINE',
-#        N'Software\Microsoft\MSSQLServer\MSSQLServer',
-#        N'NumErrorLogs',
-#        @NumErrorLogs OUTPUT;
-#        SELECT ISNULL(@NumErrorLogs, -1) AS [NumberOfLogFiles];")
-#    if ($QueryResults.config_value -ne 0 -or $QueryResults.run_value -ne 0) {
-#        Write-Output("xp_cmdshell enabled +0")
-#        if ($Fix_Allowed -eq 1) {
-#            $Query = "EXECUTE sp_configure 'xp_cmdshell', 0;`nRECONFIGURE;"
-#            $UserInput = Read-Host("disable xp_cmdshell by running the following? [Y/n]`n$($Query)`n")
-#            if ($UserInput -Notmatch "n") {
-#                Invoke-Sqlcmd -Query $Query
-#                Write-Output("xp_cmdshell disabled +1")
-#                return 1
-#            }
-#        }
-#        return 0
-#    }
-#    else {
-#        Write-Output("xp_cmdshell disabled +1")
-#        return 1
-#    }
+   $QueryResults = @(Invoke-Sqlcmd -Query "DECLARE @NumErrorLogs int;
+        EXECUTE master.sys.xp_instance
+        N'HKEY LOCAL MACHINE',
+        N'Software\Microsoft\MSSQLServer\MSSQLServer',
+        N'NumErrorLogs',
+        @NumErrorLogs OUTPUT;
+        SELECT ISNULL(@NumErrorLogs, -1) AS [NumberOfLogFiles];")
+    if ($QueryResults.config_value -ne 0 -or $QueryResults.run_value -ne 0) {
+        Write-Output("xp_cmdshell enabled +0")
+        if ($Fix_Allowed -eq 1) {
+            $Query = "EXECUTE sp_configure 'xp_cmdshell', 0;`nRECONFIGURE;"
+            $UserInput = Read-Host("disable xp_cmdshell by running the following? [Y/n]`n$($Query)`n")
+            if ($UserInput -Notmatch "n") {
+                Invoke-Sqlcmd -Query $Query
+                Write-Output("xp_cmdshell disabled +1")
+                return 1
+            }
+        }
+        return 0
+    }
+    else {
+        Write-Output("xp_cmdshell disabled +1")
+        return 1
+    }
 }
 
 # 6.2
@@ -502,10 +623,10 @@ function AsymmetricKeySize {
 
 
 function main {
+    $SQLVersion = [int](Invoke-Sqlcmd -Query "SELECT @@VERSION").Column1.Substring(23, 2)
     $Score = 0
 
-    $UserInput = Read-Host("Would you like to see potential fixes for problems found? [N/y]")
-    if ($UserInput -Notmatch "y") {
+    if (Read-Host("Would you like to see potential fixes for problems found? [N/y]") -Notmatch "y") {
         $Fix_Allowed = 1
     }
 
@@ -521,8 +642,8 @@ function main {
               S-Name_Conf_InUse.F-SysConf "'Scan for startup procs'" + # 2.8
               RemoteAdminConnection # 2.9
               if ((Invoke-Sqlcmd "SELECT SERVERPROPERTY('IsClustered') AS is_clustered;").is_clustered -eq 0) { # if server is not clustered
-                $Score += S-Name_Conf_InUse.F-SysConf -Name "'Remote admin connections'" -PreQ "USE master; GO" + # 2.7
-                          HideInstance # 2.12
+                $Score += S-Name_Conf_InUse.F-SysConf -Name "'Remote admin connections'" -PreQ "USE master; GO" # 2.7
+                if ($SQLVersion -eq 14) {$Score += HideInstance} # 2.12
               }
     $SaScore= saDisabled_Renamed # 2.13 - 2.14
     $Score += $SaScore[0] + $SaScore[1]
@@ -532,9 +653,9 @@ function main {
               ServerAuthentication + # 3.1
               GuestConnect + # 3.2
               OrphanedUsers + # 3.3
-              Contained_Authentication + # 3.4
-
-              S-Name_Conf_InUse.F-SysConf -Name "'Default trace enabled'" -Value 1 # 5.2
+              Contained_Authentication # 3.4
+    if ($SQLVersion -eq 14) {$Score += MaxLogFiles} # 5.1
+    $Score += S-Name_Conf_InUse.F-SysConf -Name "'Default trace enabled'" -Value 1 # 5.2
     $Score += CLRAssemblyPermission + # 6.2
               SymmetricEncryptionAlgorithm + # 7.1
               AsymmetricKeySize # 7.2
